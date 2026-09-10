@@ -1,0 +1,235 @@
+// Colony Wi-Fi — database schema
+// Source of truth for durable business state (Section 6/7 of the build handout).
+// Supabase Postgres. Migrations are hand-authored in prisma/migrations/ to
+// include CHECK constraints Prisma's schema DSL cannot express directly.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+  TIMEOUT
+  RECONCILIATION_REQUIRED
+}
+
+enum PaymentVerificationStatus {
+  UNVERIFIED
+  VERIFIED
+  VERIFICATION_FAILED
+}
+
+enum EntitlementStatus {
+  PENDING_AUTHORIZATION
+  ACTIVE
+  EXPIRED
+  REVOKED
+  AUTHORIZATION_FAILED
+}
+
+enum SessionStatus {
+  ACTIVE
+  ENDED
+  EXPIRED
+  UNKNOWN
+}
+
+enum RouterHealthStatus {
+  HEALTHY
+  UNHEALTHY
+  UNKNOWN
+}
+
+enum RouterEventSeverity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+// ---------------------------------------------------------------------------
+// Models
+// ---------------------------------------------------------------------------
+
+model Admin {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String    @map("password_hash")
+  active       Boolean   @default(true)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+  lastLoginAt  DateTime? @map("last_login_at")
+
+  @@map("admins")
+}
+
+model Package {
+  id                String   @id @default(uuid())
+  name              String   @unique
+  priceKes          Int      @map("price_kes") // whole KES, no fractional cents in M-Pesa STK
+  durationSeconds   Int      @map("duration_seconds")
+  bandwidthDownMbps Int      @map("bandwidth_down_mbps")
+  bandwidthUpMbps   Int      @map("bandwidth_up_mbps")
+  dataLimitBytes    BigInt?  @map("data_limit_bytes")
+  enabled           Boolean  @default(true)
+  createdAt         DateTime @default(now()) @map("created_at")
+  updatedAt         DateTime @updatedAt @map("updated_at")
+
+  payments     Payment[]
+  entitlements Entitlement[]
+
+  @@map("packages")
+}
+
+model Customer {
+  id         String   @id @default(uuid())
+  phoneE164  String   @unique @map("phone_e164")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+  lastSeenAt DateTime? @map("last_seen_at")
+
+  payments     Payment[]
+  entitlements Entitlement[]
+  sessions     Session[]
+
+  @@map("customers")
+}
+
+model Payment {
+  id                    String                    @id @default(uuid())
+  customerId            String                    @map("customer_id")
+  packageId             String                    @map("package_id")
+  amountKes             Int                       @map("amount_kes")
+  phoneE164             String                    @map("phone_e164")
+  status                PaymentStatus             @default(PENDING)
+  merchantRequestId     String?                   @unique @map("merchant_request_id")
+  checkoutRequestId     String?                   @unique @map("checkout_request_id")
+  mpesaReceiptNumber    String?                   @unique @map("mpesa_receipt_number")
+  transactionDate       DateTime?                 @map("transaction_date")
+  resultCode            Int?                      @map("result_code")
+  resultDescription     String?                   @map("result_description")
+  callbackReceivedAt    DateTime?                 @map("callback_received_at")
+  verificationStatus    PaymentVerificationStatus @default(UNVERIFIED) @map("verification_status")
+  idempotencyKey        String                    @unique @map("idempotency_key")
+  // Normalized, non-sensitive callback metadata only. Never store PIN/MSISDN
+  // beyond what's already tracked, and never store raw provider secrets here.
+  callbackMetadata       Json?                     @map("callback_metadata")
+  createdAt              DateTime                  @default(now()) @map("created_at")
+  updatedAt              DateTime                  @updatedAt @map("updated_at")
+
+  customer     Customer      @relation(fields: [customerId], references: [id])
+  package      Package       @relation(fields: [packageId], references: [id])
+  entitlements Entitlement[]
+
+  @@index([status])
+  @@index([createdAt])
+  @@index([customerId])
+  @@map("payments")
+}
+
+model Entitlement {
+  id             String             @id @default(uuid())
+  customerId     String             @map("customer_id")
+  paymentId      String             @unique @map("payment_id") // one entitlement per payment — section 14
+  packageId      String             @map("package_id")
+  startsAt       DateTime           @map("starts_at")
+  expiresAt      DateTime           @map("expires_at")
+  status         EntitlementStatus  @default(PENDING_AUTHORIZATION)
+  authorizedAt   DateTime?          @map("authorized_at")
+  revokedAt      DateTime?          @map("revoked_at")
+  createdAt      DateTime           @default(now()) @map("created_at")
+  updatedAt      DateTime           @updatedAt @map("updated_at")
+
+  customer Customer  @relation(fields: [customerId], references: [id])
+  payment  Payment   @relation(fields: [paymentId], references: [id])
+  package  Package   @relation(fields: [packageId], references: [id])
+  sessions Session[]
+
+  @@index([customerId])
+  @@index([status])
+  @@index([expiresAt])
+  @@map("entitlements")
+}
+
+model Session {
+  id               String        @id @default(uuid())
+  customerId       String        @map("customer_id")
+  entitlementId    String?       @map("entitlement_id")
+  routerId         String        @map("router_id")
+  macAddress       String?       @map("mac_address")
+  ipAddress        String?       @map("ip_address")
+  hotspotUsername  String?       @map("hotspot_username")
+  startedAt        DateTime      @default(now()) @map("started_at")
+  endedAt          DateTime?     @map("ended_at")
+  lastSeenAt       DateTime?     @map("last_seen_at")
+  bytesIn          BigInt?       @map("bytes_in")
+  bytesOut         BigInt?       @map("bytes_out")
+  status           SessionStatus @default(ACTIVE)
+
+  customer    Customer     @relation(fields: [customerId], references: [id])
+  entitlement Entitlement? @relation(fields: [entitlementId], references: [id])
+  router      Router       @relation(fields: [routerId], references: [id])
+
+  @@index([customerId])
+  @@index([status])
+  @@map("sessions")
+}
+
+model Router {
+  id                  String              @id @default(uuid())
+  name                String
+  managementAddress   String              @map("management_address")
+  apiTransport        String              @map("api_transport")
+  enabled             Boolean             @default(true)
+  lastHealthCheckAt   DateTime?           @map("last_health_check_at")
+  healthStatus        RouterHealthStatus  @default(UNKNOWN) @map("health_status")
+  createdAt           DateTime            @default(now()) @map("created_at")
+  updatedAt           DateTime            @updatedAt @map("updated_at")
+
+  sessions Session[]
+  events   RouterEvent[]
+
+  @@map("routers")
+}
+
+model RouterEvent {
+  id            String               @id @default(uuid())
+  routerId      String               @map("router_id")
+  eventType     String               @map("event_type")
+  severity      RouterEventSeverity  @default(INFO)
+  message       String
+  correlationId String?              @map("correlation_id")
+  createdAt     DateTime             @default(now()) @map("created_at")
+
+  router Router @relation(fields: [routerId], references: [id])
+
+  @@index([routerId])
+  @@map("router_events")
+}
+
+model AuditLog {
+  id           String   @id @default(uuid())
+  actor        String
+  action       String
+  resourceType String   @map("resource_type")
+  resourceId   String?  @map("resource_id")
+  metadata     Json?
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  @@index([resourceType, resourceId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
